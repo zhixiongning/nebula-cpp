@@ -234,7 +234,12 @@ void MetaClient::getResponse(Request req,
                              RespGenerator respGen,
                              folly::Promise<std::pair<bool, Response>> pro) {
   auto* evb = DCHECK_NOTNULL(ioExecutor_)->getEventBase();
-  HostAddr host = metaAddrs_.back();
+  
+  HostAddr host;
+  {
+    std::lock_guard<std::mutex> holder(hostLock_);
+    host = leader_;
+  }
   folly::via(evb,
              [host,
               evb,
@@ -242,28 +247,94 @@ void MetaClient::getResponse(Request req,
               remoteFunc = std::move(remoteFunc),
               respGen = std::move(respGen),
               pro = std::move(pro),
+              retry,
+              retryLimit,
               this]() mutable {
-               auto client = clientsMan_->client(host, evb, false, mConfig_.clientTimeoutInMs_);
-               LOG(INFO) << "Send request to meta " << host;
-               remoteFunc(client, req)
-                   .via(evb)
-                   .then([host, respGen = std::move(respGen), pro = std::move(pro)](
-                             folly::Try<RpcResponse>&& t) mutable {
-                     // exception occurred during RPC
-                     if (t.hasException()) {
-                       LOG(ERROR) << "Send request to meta" << host << " failed";
-                       pro.setValue(std::make_pair(false, Response()));
-                       return;
-                     }
-                     auto&& resp = t.value();
-                     if (resp.get_code() == nebula::cpp2::ErrorCode::SUCCEEDED) {
-                       // succeeded
-                       pro.setValue(respGen(std::move(resp)));
-                       return;
-                     }
-                     pro.setValue(std::make_pair(false, Response()));
-                   });  // then
-             });        // via
+                auto client = clientsMan_->client(host, evb, false, mConfig_.clientTimeoutInMs_);
+                LOG(INFO) << "Send request to meta " << host;
+                remoteFunc(client, req)
+                    .via(evb)
+                    .then([host,
+                          req = std::move(req),
+                          remoteFunc = std::move(remoteFunc),
+                          respGen = std::move(respGen),
+                          pro = std::move(pro),
+                          retry,
+                          retryLimit,
+                          evb,
+                          this](folly::Try<RpcResponse>&& t) mutable {
+                      // exception occurred during RPC
+                        if (t.hasException()) {
+                          updateLeader();
+                          if (retry < retryLimit) {
+                            evb->runAfterDelay(
+                                [req = std::move(req),
+                                remoteFunc = std::move(remoteFunc),
+                                respGen = std::move(respGen),
+                                pro = std::move(pro),
+                                retry,
+                                retryLimit,
+                                this]() mutable {
+                                  getResponse(std::move(req),
+                                              std::move(remoteFunc),
+                                              std::move(respGen),
+                                              std::move(pro),
+                                              retry + 1,
+                                              retryLimit);
+                                },
+                                1000);
+                            return;
+                          } else {
+                            LOG(ERROR) << "Send request to " << host << ", exceed retry limit";
+                            pro.setValue(std::make_pair(false, Response()));
+                          }
+                          return;
+                        }
+
+                        auto&& resp = t.value();
+                        auto code = resp.get_code();
+                        if (code == nebula::cpp2::ErrorCode::SUCCEEDED) {
+                          // succeeded
+                          pro.setValue(respGen(std::move(resp)));
+                          return;
+                        } else if (code == nebula::cpp2::ErrorCode::E_LEADER_CHANGED ||
+                                  code == nebula::cpp2::ErrorCode::E_MACHINE_NOT_FOUND) {
+                          updateLeader(resp.get_leader());
+                          if (retry < retryLimit) {
+                            evb->runAfterDelay(
+                                [req = std::move(req),
+                                remoteFunc = std::move(remoteFunc),
+                                respGen = std::move(respGen),
+                                pro = std::move(pro),
+                                retry,
+                                retryLimit,
+                                this]() mutable {
+                                  getResponse(std::move(req),
+                                              std::move(remoteFunc),
+                                              std::move(respGen),
+                                              std::move(pro),
+                                              retry + 1,
+                                              retryLimit);
+                                },
+                                1000);
+                            return;
+                          }
+                        } else if (code == nebula::cpp2::ErrorCode::E_CLIENT_SERVER_INCOMPATIBLE) {
+                          pro.setValue(respGen(std::move(resp)));
+                          return;
+                        }
+                        pro.setValue(std::make_pair(false, Response()));
+                    });  // then
+              });        // via
+}
+
+void MetaClient::updateLeader(HostAddr leader) {
+  std::lock_guard<std::mutex> holder(hostLock_);
+  if (leader != HostAddr("", 0)) {
+    leader_ = leader;
+  } else {
+    leader_ = addrs_[folly::Random::rand64(addrs_.size())];
+  }
 }
 
 }  // namespace nebula

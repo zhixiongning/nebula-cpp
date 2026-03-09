@@ -11,6 +11,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <mutex>
 
 #include "common/datatypes/HostAddr.h"
 #include "common/thrift/ThriftTypes.h"
@@ -108,7 +109,10 @@ class MetaClient {
   void getResponse(Request req,
                    RemoteFunc remoteFunc,
                    RespGenerator respGen,
-                   folly::Promise<std::pair<bool, Response>> pro);
+                   folly::Promise<std::pair<bool, Response>> pro,
+                   int32_t retry = 0,
+                   int32_t retry_limit = 3);
+  void updateLeader(HostAddr leader = HostAddr());
 
  private:
   std::vector<HostAddr> metaAddrs_;
@@ -116,6 +120,8 @@ class MetaClient {
   SpaceNameIdMap spaceIndexByName_;
   SpaceEdgeNameTypeMap spaceEdgeIndexByName_;
   SpaceTagNameTypeMap spaceTagIndexByName_;
+  std::mutex hostLock_;
+  HostAddr leader_;
   std::unordered_map<std::pair<GraphSpaceID, PartitionID>, HostAddr, pair_hash> spacePartLeaderMap_;
   std::unordered_map<GraphSpaceID, std::vector<PartitionID>> spacePartsMap_;
   std::shared_ptr<folly::IOThreadPoolExecutor> ioExecutor_;
